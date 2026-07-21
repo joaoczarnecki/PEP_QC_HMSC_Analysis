@@ -1,0 +1,17 @@
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+
+# Large binary model/prediction artefacts are intentionally NOT tracked here.
+# See README.md "Large data & model artefacts" for where they actually live.
+*.Rda
+*.RData
+data_raw/
