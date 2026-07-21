@@ -5,21 +5,22 @@ Git is now installed as a **portable MinGit** at
 **Open a brand-new terminal/VS Code window** for the PATH change to take
 effect — then plain `git` commands work without a full path.
 
-This repo has already been initialized and committed locally (`git init`,
-`git add .`, first commit). What's left is pushing it somewhere.
+This repo has been initialized, committed locally, pushed, and now lives at
+<https://github.com/joaoczarnecki/PEP_QC_HMSC_Analysis> (created **private**
+via `gh repo create`), on branch `main`.
 
-## Push to GitHub
-
-This repo does not yet have a remote configured — no GitHub URL was given
-for it (only the TCAMS app repo had an existing URL). To publish it:
+## Pushing further changes
 
 ```powershell
-# 1. Create a new, empty repository on GitHub first (e.g. via github.com/new
-#    or `gh repo create`), WITHOUT initializing it with a README/.gitignore.
+git add .
+git commit -m "..."
+git push
+```
 
-# 2. From this folder:
-git remote add origin https://github.com/<your-username>/<repo-name>.git
-git push -u origin main
+If you'd rather make it public later:
+
+```powershell
+gh repo edit joaoczarnecki/PEP_QC_HMSC_Analysis --visibility public
 ```
 
 ## Notes specific to this session's environment
