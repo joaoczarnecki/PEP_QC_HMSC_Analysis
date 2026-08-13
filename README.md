@@ -72,6 +72,28 @@ future re-fit, rather than silently living only in code:
    effect (`unique(studyDesign$site) == studyDesign$site`). Neither affected
    the already-fitted model saved to disk; they only blocked a from-scratch
    re-execution of the script.
+7. **Community/vegetation-type trajectories are a province-wide average of
+   the community's defining species set, not an average restricted to plots
+   actually classified as that ecological type in the forest inventory.**
+   Traced in `003_compute_csi_from_draws.R`: `process_scenario()` loads the
+   full posterior prediction array for **all** ~5,572 modelled plots
+   (`draws_array <- coerce_pred_obj_to_draws(preds)`) and, per community,
+   only subsets the **species** dimension to that community's member species
+   (`species_vec <- intersect(comm$species, available_species)`;
+   `draws_sub <- draws_array[, , species_idx, drop = FALSE]`) — the **site**
+   dimension is never filtered by `plot_id`/inventory-classified `type_eco`
+   anywhere in the pipeline (confirmed in `compute_indices_from_draws_legacy()`
+   and `compute_gCSI_matrix()`, both of which iterate over every site in the
+   array). `summarise_community_indices_from_draws()` /
+   `summarise_community_gCSI_matrix()` then average across *all* of those
+   sites. In other words, a community's gCSI/bCSI/wCSI trajectory answers
+   "how suitable is the *whole study area*, on average, for this species
+   assemblage" — not "how suitable are the areas *currently occupied* by
+   this vegetation type." This is consistent with how the manuscript defines
+   CSI (a suitability index computable at any location for a target
+   community), but is worth stating explicitly in the methods/discussion, since
+   a reader could otherwise assume "FE3 trajectory" means plots inventoried
+   as FE3 specifically.
 
 ## Provenance & assumptions made during this reorganization
 
