@@ -1,0 +1,990 @@
+---
+title: "Community Suitability Modelling of Quebec Forests with HMSC"
+subtitle: "Reproducible Analysis Code for: Beyond Moving a Single Species: Using Community Suitability to Inform Climate Adaptation in the Boreal-Temperate Ecotone"
+author: "João Paulo C. Liz¹, Nelson Thiffault², David Voyer¹, Loïc D’Orangeville¹, Nicholas C. Coops³ and Alexis Achim¹\n¹Faculty of Forestry, Geography and Geomatics, Laval University, Quebec, Canada
+²Canadian Forest Service, Natural Resources Canada, Quebec, Canada
+³Department of Forest Resources Management, University of British Columbia, Vancouver, Canada
+"
+date: "`r paste(month.name[as.integer(format(Sys.Date(), '%m'))], format(Sys.Date(), '%d, %Y'))`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: readable
+    df_print: kable
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r global-options, include = FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 5,
+  dpi        = 150,
+  linewidth  = 80
+)
+options(scipen = 999)
+
+# Wrap long source lines in the PDF output so code never overflows the page
+# margin (HTML output already wraps/scrolls, so this only affects the PDF).
+hook_source <- knitr::knit_hooks$get("source")
+knitr::knit_hooks$set(source = function(x, options) {
+  if (knitr::is_latex_output() && !is.null(n <- options$linewidth)) {
+    x <- knitr:::split_lines(x)
+    if (any(nchar(x) > n)) x <- strwrap(x, width = n, exdent = 2)
+    x <- paste(x, collapse = "\n")
+  }
+  hook_source(x, options)
+})
+```
+
+# Overview
+
+This document is the reproducible companion code for the manuscript *"Beyond
+Single Species: Using Community Suitability to Inform Climate Adaptation in
+the Boreal-Temperate Ecotone"*. It walks through every analytical step
+described in the Methods section, in the order they are described there:
+
+| Section below                                   | Manuscript section                       | Original script                                |
+|--------------------------------------------------|-------------------------------------------|--------------------------------------------------|
+| 2. Study area and sampling design                | Section 2 (Study Area)                    | `000_study_area_map.R`                          |
+| 3. Forest inventory data and predictors           | 3.1 Data                                  | `001_fit_hmsc_model.R` (data section)           |
+| 4. HMSC model specification and fitting           | 3.2.1--3.2.2 Modeling                     | `001_fit_hmsc_model.R` (model section)          |
+| 5. MCMC convergence diagnostics                   | 3.2.2 / Figure A3                          | `001_fit_hmsc_model.R`                          |
+| 6. Explanatory and predictive model performance   | 3.2.2 / Table 2                            | `001_fit_hmsc_model.R`, `008_cv_predictive_power.R`, `009_cv_results_table_plots.R` |
+| 7. Variance partitioning                          | 3.2.3 / Figure 1                           | `001_fit_hmsc_model.R`                          |
+| 8. Species environmental niches (beta)            | 3.2.3 / Figure 4                           | `001_fit_hmsc_model.R`                          |
+| 9. Species associations (Omega)                   | 3.2.3 / Figure A4-A5                       | `001_fit_hmsc_model.R`                          |
+| 10. Future climate scenarios and predictions      | 3.1.3, 3.2.3                                | `002_predict_future_scenarios.R`                |
+| 11. Community Suitability Index (CSI)             | 3.3                                         | `003_compute_csi_from_draws.R`                  |
+| 12. CSI trajectories under climate change         | 4.3 / Figure 3, Figure A7                   | `003a_plot_csi_trajectories.R`                  |
+| 13. Appendix: draws subsampling for the TCAMS app | 3.5 (TCAMS tool)                            | `004_prepare_app_draws_subsample.R`             |
+
+## How to use this document
+
+Several steps in this pipeline are **computationally heavy** -- most notably
+fitting the HMSC model itself (four MCMC chains, 150,000 iterations each),
+the four-fold cross-validation used to assess predictive power (which refits
+the model once per fold), and generating posterior predictions for the 12
+future climate scenarios. Re-running these from scratch is **not required**
+to reproduce the manuscript's tables and figures, since every heavy step
+saves its output to disk, and this document loads the saved object right
+after showing the code that produced it.
+
+A single switch controls this behaviour:
+
+```{r run-heavy-flag}
+# Set to TRUE only if you want to literally re-run the multi-hour steps
+# (model fitting, cross-validation, future-climate prediction) from raw data.
+# Leave FALSE to reproduce all tables/figures from the saved outputs that
+# accompany this submission.
+RUN_HEAVY <- FALSE
+```
+
+Every heavy chunk below is guarded by `eval = RUN_HEAVY`, and is immediately
+followed by a chunk guarded by `eval = !RUN_HEAVY` that loads the
+corresponding pre-computed object. Either way, by the end of each section the
+same R objects are available in the environment, so downstream code and
+figures render identically.
+
+# 1. Environment and Path Configuration
+
+```{r setup-libs}
+# --- Library path -----------------------------------------------------------
+# Edit this if reproducing on a different machine; it must point to the
+# folder containing the Hmsc, coda, BayesLogit, sf, tidyverse, etc. packages.
+.libPaths("H:/R_lib")
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+pkgs <- c("tidyverse", "sf", "Hmsc", "coda", "BayesLogit", "knitr",
+          "kableExtra", "ggcorrplot", "igraph", "ggraph", "scales",
+          "viridis", "ggrepel", "rnaturalearth", "rnaturalearthdata",
+          "ggspatial", "patchwork", "abind")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, lib = "H:/R_lib")
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(sf)
+  library(BayesLogit)   # required internally by Hmsc's parallel workers
+  library(Hmsc)
+  library(coda)
+  library(knitr)
+  library(kableExtra)
+})
+```
+
+```{r setup-paths}
+# --- Project folders ---------------------------------------------------------
+# All paths below are relative to a single base directory. Edit BASE_DIR to
+# point to the "PEP_QC" project root on your own machine; everything else is
+# derived from it and does not need to be touched.
+BASE_DIR    <- "G:/Thesis/3rdChapter/PEP_QC"
+DATA_DIR    <- file.path(BASE_DIR, "databases")
+RESULTS_DIR <- file.path(BASE_DIR, "results", "undisturbed")
+MODEL_DIR   <- file.path(RESULTS_DIR, "hmsc")
+FIGS_DIR    <- file.path(RESULTS_DIR, "hmsc_figures")
+MAPS_DIR    <- file.path(BASE_DIR, "results", "maps")
+OUTPUTS_DIR <- file.path(RESULTS_DIR, "outputs")
+DRAWS_DIR   <- file.path(BASE_DIR, "posterior_draws1")
+
+MODEL_FILE  <- file.path(MODEL_DIR, "hmsc_presence_model.Rdata")
+CV_FILE     <- file.path(MODEL_DIR, "hmsc_presence_model_CV.Rdata")
+
+for (d in c(FIGS_DIR, MAPS_DIR, OUTPUTS_DIR)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+```{r species-dictionary}
+# --- Species code dictionary -------------------------------------------------
+# Maps the 3-letter Quebec forest-inventory species codes (e.g. "SAB") used
+# throughout the raw data and objects to full scientific names and to the
+# short "Genus.species" labels used in figures (e.g. "Abi.bals").
+species_map <- tibble::tribble(
+  ~code, ~french_name, ~scientific_name,
+  "AEH", "Marronnier d'Inde", "Aesculus hippocastanum",
+  "AME", "Amelanchier", "Amelanchier spp.",
+  "AUC", "Aulne crispe", "Alnus crispa",
+  "AUR", "Aulne rugueux", "Alnus incana",
+  "BOG", "Bouleau gris", "Betula populifolia",
+  "BOJ", "Bouleau jaune", "Betula alleghaniensis",
+  "BOP", "Bouleau a papier", "Betula papyrifera",
+  "CAC", "Caryer cordiforme", "Carya cordiformis",
+  "CAF", "Caryer ovale", "Carya ovata",
+  "CAR", "Charme de Caroline", "Carpinus caroliniana",
+  "CET", "Cerisier tardif", "Prunus serotina",
+  "CHB", "Chene blanc", "Quercus alba",
+  "CHE", "Chene bicolore", "Quercus bicolor",
+  "CHG", "Chene a gros fruits", "Quercus macrocarpa",
+  "CHR", "Chene rouge", "Quercus rubra",
+  "EPB", "Epinette blanche", "Picea glauca",
+  "EPN", "Epinette noire", "Picea mariana",
+  "EPO", "Epinette de Norvege", "Picea abies",
+  "EPR", "Epinette rouge", "Picea rubens",
+  "ERA", "Erable argente", "Acer saccharinum",
+  "ERB", "Erable de Norvege", "Acer platanoides",
+  "ERE", "Erable a epis", "Acer spicatum",
+  "ERG", "Erable a Giguere", "Acer negundo",
+  "ERN", "Erable noir", "Acer nigrum",
+  "ERP", "Erable de Pennsylvanie", "Acer pensylvanicum",
+  "ERR", "Erable rouge", "Acer rubrum",
+  "ERS", "Erable a sucre", "Acer saccharum",
+  "FRA", "Frene d'Amerique", "Fraxinus americana",
+  "FRN", "Frene noir", "Fraxinus nigra",
+  "FRP", "Frene de Pennsylvanie", "Fraxinus pennsylvanica",
+  "HEG", "Hetre a grandes feuilles", "Fagus grandifolia",
+  "MEL", "Meleze laricin", "Larix laricina",
+  "NOC", "Noyer cendre", "Juglans cinerea",
+  "ORA", "Orme d'Amerique", "Ulmus americana",
+  "ORR", "Orme rouge", "Ulmus rubra",
+  "ORT", "Orme de Thomas", "Ulmus thomasii",
+  "OSV", "Ostryer de Virginie", "Ostrya virginiana",
+  "PEB", "Peuplier baumier", "Populus balsamifera",
+  "PEG", "Peuplier a grandes dents", "Populus grandidentata",
+  "PET", "Peuplier faux-tremble", "Populus tremuloides",
+  "PIB", "Pin blanc", "Pinus strobus",
+  "PIG", "Pin gris", "Pinus banksiana",
+  "PIR", "Pin rouge", "Pinus resinosa",
+  "PIS", "Pin sylvestre", "Pinus sylvestris",
+  "PRU", "Pruche de l'Est", "Tsuga canadensis",
+  "PRP", "Cerisier de Pennsylvanie", "Prunus pensylvanica",
+  "SAB", "Sapin baumier", "Abies balsamea",
+  "SOA", "Sorbier d'Amerique", "Sorbus americana",
+  "SOD", "Sorbier des montagnes", "Sorbus decora",
+  "THO", "Thuya occidental", "Thuja occidentalis",
+  "TIL", "Tilleul d'Amerique", "Tilia americana"
+) %>%
+  mutate(
+    original_name_in_data = paste0(code, "_n"),
+    pretty_name = sapply(scientific_name, function(sci) {
+      parts   <- strsplit(sci, " ")[[1]]
+      genus   <- substr(parts[1], 1, 3)
+      species <- if (length(parts) > 1) substr(parts[2], 1, 4) else ""
+      paste0(stringr::str_to_title(genus), ".", species)
+    })
+  )
+
+knitr::kable(species_map %>% select(code, scientific_name, pretty_name),
+             caption = "Species code dictionary used throughout this document.")
+```
+
+# 2. Study Area and Sampling Design (Figure 1)
+
+The study area covers Quebec's temperate and boreal forest regions south of
+the 52nd parallel. The map below shows the 5,572 permanent sample plots used
+in the final model together with the ten bioclimatic domains of Quebec
+(Saucier et al., 2009), which give visual context to the boreal-temperate
+ecotone referenced throughout the manuscript.
+
+```{r figure1-map, fig.cap = "Study area: permanent sample plots (coloured by Mean Annual Temperature) over Quebec's bioclimatic domains, ordered from temperate hardwood (south) to forest tundra (north)."}
+suppressPackageStartupMessages({
+  library(rnaturalearth); library(rnaturalearthdata)
+  library(ggspatial); library(patchwork); library(scales); library(viridis)
+  library(ggrepel)
+})
+
+# --- Permanent sample plots used in the fitted model -------------------------
+# We restrict to the exact set of sites that entered the fitted model, so
+# that "n" in the figure caption always matches the model's sample size,
+# even if the raw inventory CSV contains additional (later-dropped) plots.
+model_env <- new.env(parent = emptyenv())
+load(MODEL_FILE, envir = model_env)
+model_sites <- rownames(model_env$m1$Y)
+
+plots_sf <- read_csv(file.path(DATA_DIR, "undisturbed_plots_sf_env_clim_4th_inv.csv"),
+                      show_col_types = FALSE) %>%
+  dplyr::select(plot_id, latitude, longitude, MAT, MAP) %>%
+  filter(!is.na(longitude), !is.na(latitude),
+         as.character(plot_id) %in% model_sites) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+cat("Plots in fitted model:", length(model_sites),
+    "| Plots shown on map:", nrow(plots_sf), "\n")
+
+# --- Bioclimatic domains (Saucier et al. 2009) -------------------------------
+# N3_DOM_BIO layer of Quebec's official ecological classification geodatabase:
+# the ten classic bioclimatic domains, ordered south (temperate hardwood) to
+# north (forest tundra); directly matches the community codes used in Table 1
+# of the manuscript (e.g. domain 3 = community FE3, domain 6 = community RE2).
+gdb_zip <- file.path(BASE_DIR, "MAT_QUEBEC_VEG", "CLASSI_ECO_QC_GDB.zip")
+gdb_vsizip <- paste0("/vsizip/", gdb_zip, "/CLASSI_ECO_QC_GDB/CLASSI_ECO_QC.gdb")
+
+dom_bio_raw <- st_read(gdb_vsizip, layer = "N3_DOM_BIO", quiet = TRUE)
+if (is.na(st_crs(dom_bio_raw))) st_crs(dom_bio_raw) <- 32198  # NAD83 / Quebec Lambert
+dom_bio_raw <- st_make_valid(dom_bio_raw)
+
+domain_labels <- c(
+  "Erabliere a caryer cordiforme" = "1. Sugar maple - bitternut hickory",
+  "Erabliere a tilleul"           = "2. Sugar maple - basswood",
+  "Erabliere a bouleau jaune"     = "3. Sugar maple - yellow birch",
+  "Sapiniere a bouleau jaune"     = "4. Balsam fir - yellow birch",
+  "Sapiniere a bouleau a papier"  = "5. Balsam fir - paper birch",
+  "Pessiere a mousses"            = "6. Black spruce - moss",
+  "Pessiere a lichens"            = "7. Black spruce - lichen",
+  "Toundra forestiere"            = "8. Forest tundra",
+  "Toundra a arbustes dresses"    = "9. Shrub tundra (erect)",
+  "Toundra a arbustes prostres"   = "10. Shrub tundra (prostrate)"
+)
+# NOM_DB is stored with accented French characters; normalise before recoding.
+nom_ascii <- iconv(dom_bio_raw$NOM_DB, from = "UTF-8", to = "ASCII//TRANSLIT")
+dom_bio_raw$domain_en <- factor(dplyr::recode(nom_ascii, !!!domain_labels),
+                                 levels = unname(domain_labels))
+
+domain_colors <- c(
+  "1. Sugar maple - bitternut hickory" = "#1B5E20",
+  "2. Sugar maple - basswood"          = "#33691E",
+  "3. Sugar maple - yellow birch"      = "#7CB342",
+  "4. Balsam fir - yellow birch"       = "#AED581",
+  "5. Balsam fir - paper birch"        = "#4FC3F7",
+  "6. Black spruce - moss"             = "#0288D1",
+  "7. Black spruce - lichen"           = "#01579B",
+  "8. Forest tundra"                   = "#78909C",
+  "9. Shrub tundra (erect)"            = "#B0BEC5",
+  "10. Shrub tundra (prostrate)"       = "#CFD8DC"
+)
+
+# --- Reference boundaries -----------------------------------------------------
+LAMBERT_QC <- 32198
+all_states <- sf::st_as_sf(rnaturalearthdata::states50) %>% st_make_valid()
+provinces  <- all_states %>% filter(admin == "Canada")
+us_states  <- all_states %>% filter(admin == "United States of America")
+world      <- ne_countries(scale = "medium", returnclass = "sf") %>% st_make_valid()
+quebec_sf  <- provinces %>% filter(name == "Quebec") %>% st_make_valid()
+context_sf <- bind_rows(
+  provinces %>% filter(name %in% c("Ontario", "New Brunswick", "Nova Scotia",
+                                    "Newfoundland and Labrador", "Prince Edward Island")),
+  us_states %>% filter(name %in% c("Maine", "Vermont", "New Hampshire",
+                                    "New York", "Massachusetts"))
+) %>% st_make_valid()
+
+bbox_wgs <- st_bbox(c(xmin = -80, xmax = -57, ymin = 44.5, ymax = 53), crs = st_crs(4326))
+bbox_lam <- st_bbox(st_transform(st_as_sfc(bbox_wgs), LAMBERT_QC))
+clip_lam       <- st_as_sfc(bbox_lam) %>% st_buffer(500000) %>% st_make_valid()
+clip_lam_tight <- st_as_sfc(bbox_lam) %>% st_buffer(50000)  %>% st_make_valid()
+
+safe_project <- function(x, crs, clip) {
+  x %>% st_transform(crs) %>% st_make_valid() %>%
+    st_intersection(clip) %>% st_make_valid()
+}
+world_p   <- safe_project(world,      LAMBERT_QC, clip_lam)
+context_p <- safe_project(context_sf, LAMBERT_QC, clip_lam)
+dom_bio_p <- safe_project(dom_bio_raw, LAMBERT_QC, clip_lam_tight)
+plots_p   <- st_transform(plots_sf, LAMBERT_QC)
+
+parallel_52 <- st_linestring(matrix(c(-82, 52, -56, 52), ncol = 2, byrow = TRUE)) %>%
+  st_sfc(crs = 4326) %>% st_sf() %>% st_transform(LAMBERT_QC)
+label_52N <- st_coordinates(st_transform(st_sfc(st_point(c(-73, 52.1)), crs = 4326), LAMBERT_QC))
+
+cities <- tribble(
+  ~name,           ~lon,      ~lat,
+  "Montreal",      -73.5673,  45.5017,
+  "Quebec City",   -71.2080,  46.8139,
+  "Sherbrooke",    -71.8989,  45.4042,
+  "Rouyn-Noranda", -79.0210,  48.2360,
+  "Saguenay",      -71.0596,  48.4281,
+  "Sept-Iles",     -66.3821,  50.2101,
+  "Gaspe",         -64.4859,  48.8339
+) %>% st_as_sf(coords = c("lon", "lat"), crs = 4326) %>% st_transform(LAMBERT_QC)
+
+theme_map <- theme_void(base_size = 11) +
+  theme(panel.background = element_rect(fill = "#B8D4E8", colour = NA),
+        panel.border     = element_rect(fill = NA, colour = "grey35", linewidth = 0.7),
+        legend.position  = "right",
+        plot.title       = element_text(size = 12, face = "bold", hjust = 0.5))
+
+ggplot() +
+  geom_sf(data = world_p,   fill = "#EAE8E2", colour = "grey65",  linewidth = 0.10) +
+  geom_sf(data = context_p, fill = "#D8D3CB", colour = "#888888", linewidth = 0.35) +
+  geom_sf(data = dom_bio_p, aes(fill = domain_en), colour = "grey30", linewidth = 0.12) +
+  scale_fill_manual(name = "Bioclimatic domain\n(Saucier et al. 2009)",
+                     values = domain_colors, drop = TRUE) +
+  geom_sf(data = parallel_52, colour = "#CC3333", linewidth = 0.6, linetype = "dashed") +
+  annotate("text", x = label_52N[1], y = label_52N[2], label = "52\u00b0N (study limit)",
+           colour = "#CC3333", size = 3, fontface = "italic") +
+  geom_sf(data = plots_p, aes(colour = MAT), size = 0.55, alpha = 0.85, shape = 16) +
+  scale_colour_viridis_c(name = "Plot MAT (\u00b0C)", option = "plasma") +
+  geom_sf(data = cities, shape = 18, size = 2, colour = "black") +
+  geom_label_repel(data = cities, aes(geometry = geometry, label = name),
+                    stat = "sf_coordinates", size = 2.6, seed = 1304,
+                    max.overlaps = Inf, force = 8, box.padding = 0.6) +
+  coord_sf(xlim = c(bbox_lam["xmin"], bbox_lam["xmax"]),
+           ylim = c(bbox_lam["ymin"], bbox_lam["ymax"]),
+           expand = FALSE, crs = LAMBERT_QC, datum = st_crs(4326)) +
+  annotation_scale(location = "tl", width_hint = 0.22) +
+  annotation_north_arrow(location = "tl", which_north = "true",
+                          pad_y = unit(0.35, "in")) +
+  labs(title = "Study Area: Permanent Sample Plots and Bioclimatic Domains",
+       subtitle = paste0("Quebec, Canada | n = ", format(nrow(plots_sf), big.mark = ","),
+                          " undisturbed plots | below 52\u00b0N latitude")) +
+  theme_map
+```
+
+# 3. Forest Inventory Data and Predictors (Section 3.1)
+
+We use plot-level data from the 4th decennial forest inventory of Quebec's
+permanent sample plot network, restricted to plots without recorded
+anthropogenic disturbance. Species with fewer than 5% occupied plots are
+dropped, and only plots with complete environmental data are retained --
+yielding the 5,572-plot, 13-species dataset reported in the manuscript.
+
+```{r data-prep}
+plots_sf_env_clim <- read_csv(file.path(DATA_DIR, "undisturbed_plots_sf_env_clim_4th_inv.csv"),
+                               show_col_types = FALSE)
+
+# Climatic, edaphic and topographic predictors (Section 3.1.2)
+env_predictors <- c("MAP", "MAT", "pH", "Clay", "OM", "rtp", "twi",
+                     "slope", "drainage_class")
+plots_sf_env_clim$drainage_class <- as.factor(plots_sf_env_clim$drainage_class)
+
+species_abun_vars <- plots_sf_env_clim %>%
+  select(ends_with("_n") & !starts_with("NA")) %>%
+  colnames()
+
+Y_full <- plots_sf_env_clim %>%
+  dplyr::select(plot_id, all_of(species_abun_vars)) %>%
+  mutate(across(all_of(species_abun_vars), ~ as.integer(replace_na(., 0)))) %>%
+  as.data.frame() %>%
+  column_to_rownames(var = "plot_id") %>%
+  as.matrix()
+
+# Drop species present in fewer than 5% of plots
+prevalence           <- colSums(Y_full > 0, na.rm = TRUE)
+prevalence_threshold <- nrow(Y_full) * 0.05
+species_to_keep      <- names(prevalence[prevalence >= prevalence_threshold])
+Y <- Y_full[, species_to_keep]
+
+XData <- plots_sf_env_clim %>%
+  dplyr::select(plot_id, all_of(env_predictors)) %>%
+  mutate_if(is.character, as.factor) %>%
+  as.data.frame() %>%
+  column_to_rownames(var = "plot_id")
+
+# Align plots with complete environmental data and non-zero occupancy
+common_plots <- intersect(rownames(Y), rownames(na.omit(XData)))
+Y      <- Y[common_plots, ]
+XData  <- XData[common_plots, ]
+Y      <- Y[, colSums(Y) > 0]
+Y[Y > 0] <- 1  # convert abundance to presence-absence for the probit model
+
+cat("Final data dimensions -- Y (species matrix):", nrow(Y), "plots x", ncol(Y), "species\n")
+cat("Final data dimensions -- XData (covariates): ", nrow(XData), "plots x", ncol(XData), "covariates\n")
+```
+
+# 4. HMSC Model Specification and Fitting (Sections 3.2.1-3.2.2)
+
+We fit a Hierarchical Modelling of Species Communities (HMSC) probit joint
+species distribution model (Ovaskainen et al. 2017; Tikhonov et al. 2020),
+with a site-level random effect capturing residual (biotic + unmeasured)
+co-occurrence structure.
+
+```{r hmsc-specify, eval = RUN_HEAVY}
+XFormula <- as.formula(paste("~", paste(env_predictors, collapse = " + ")))
+
+studyDesign <- data.frame(site = as.factor(rownames(Y)))
+rownames(studyDesign) <- rownames(Y)
+rL_site <- HmscRandomLevel(units = studyDesign$site)
+
+mod <- Hmsc(
+  Y = Y, XData = XData, XFormula = XFormula,
+  distr = "probit",
+  studyDesign = studyDesign,
+  ranLevels = list(site = rL_site)
+)
+```
+
+```{r hmsc-fit, eval = RUN_HEAVY}
+# Four MCMC chains, 150,000 iterations each (50,000 burn-in + 100,000 sampling
+# thinned by 100 -> 1,000 posterior samples per chain, 4,000 in total).
+# This step alone takes on the order of an hour on a modern multi-core machine.
+nChains <- 4
+thin    <- 100
+samples <- 1000
+
+set.seed(1304)
+m1 <- sampleMcmc(
+  mod, samples = samples, thin = thin,
+  adaptNf   = rep(ceiling(0.4 * samples * thin), 1),
+  transient = ceiling(0.5 * samples * thin),
+  nChains = nChains, nParallel = nChains,
+  initPar = "fixed effects"
+)
+
+save(m1, file = MODEL_FILE)
+```
+
+```{r hmsc-load, eval = !RUN_HEAVY}
+# --- Load the already-fitted model instead of re-running the MCMC ----------
+load(MODEL_FILE)  # loads m1
+```
+
+```{r hmsc-summary}
+nChains <- length(m1$postList)
+cat("Fitted HMSC model summary\n")
+cat("  chains   :", nChains, "\n")
+cat("  samples  :", m1$samples, "per chain (thin =", m1$thin, ", transient =", m1$transient, ")\n")
+cat("  sites    :", m1$ny, "\n")
+cat("  species  :", m1$ns, "\n")
+cat("  distr    : probit\n")
+```
+
+# 5. MCMC Convergence Diagnostics (Figure A3)
+
+We assess convergence of the species-environmental response parameters
+(*Beta*) using the Effective Sample Size (ESS) and the Gelman-Rubin Potential
+Scale Reduction Factor (PSRF). *Note: convergence is checked here for the Beta
+parameters specifically; the residual association matrix (Omega) and
+random-effect hyperparameters are not separately diagnosed.*
+
+```{r convergence-diagnostics, fig.cap = "MCMC convergence diagnostics for the species-environmental response parameters (Beta)."}
+mpost <- convertToCodaObject(m1)
+
+ess.beta  <- effectiveSize(mpost$Beta)
+psrf.beta <- gelman.diag(mpost$Beta, multivariate = FALSE)$psrf[, "Point est."]
+
+cat("Beta ESS  : median =", round(median(ess.beta), 0),
+    "| min =", round(min(ess.beta), 0), "\n")
+cat("Beta PSRF : median =", round(median(psrf.beta), 3),
+    "| max =", round(max(psrf.beta), 3), "\n")
+
+par(mfrow = c(1, 2))
+hist(ess.beta, breaks = 30, col = "skyblue", main = "Effective Sample Size (Beta)",
+     xlab = "ESS")
+abline(v = 1000, col = "red", lty = 2, lwd = 2)
+hist(psrf.beta, breaks = 30, col = "lightgreen", main = "Gelman-Rubin PSRF (Beta)",
+     xlab = "PSRF (point estimate)")
+abline(v = 1.1, col = "red", lty = 2, lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+# 6. Explanatory and Predictive Model Performance (Table 2)
+
+## 6.1 Explanatory power (in-sample fit)
+
+```{r explanatory-fit}
+preds_explanatory <- computePredictedValues(m1)
+MF <- evaluateModelFit(hM = m1, predY = preds_explanatory)
+
+cat(sprintf("Mean explanatory AUC     = %.3f (SD = %.3f)\n", mean(MF$AUC), sd(MF$AUC)))
+cat(sprintf("Mean explanatory Tjur R2 = %.3f (SD = %.3f)\n", mean(MF$TjurR2), sd(MF$TjurR2)))
+```
+
+## 6.2 Predictive power (4-fold cross-validation)
+
+Explanatory metrics above are computed in-sample and are therefore
+optimistic. We additionally assess **predictive power** through four-fold
+cross-validation (`createPartition`), following the same protocol used by
+Tikhonov et al. (2020, Appendix S2). Each fold refits the model with the
+same MCMC settings, so this step takes roughly four times as long as the
+original fit (about 4.8 hours on the machine used for this analysis).
+
+```{r cv-run, eval = RUN_HEAVY}
+set.seed(1304)
+partition <- createPartition(m1, nfolds = 4, column = "site")
+
+predsCV <- computePredictedValues(m1, partition = partition, nParallel = nChains)
+MFCV <- evaluateModelFit(hM = m1, predY = predsCV)
+
+save(predsCV, MFCV, partition, file = CV_FILE)
+```
+
+```{r cv-load, eval = !RUN_HEAVY}
+# --- Load pre-computed cross-validation results -----------------------------
+cv_env <- new.env(parent = emptyenv())
+load(CV_FILE, envir = cv_env)  # loads predsCV, MFCV, partition
+MFCV <- cv_env$MFCV
+```
+
+```{r cv-table}
+model_fit_df <- tibble(
+  Species            = colnames(m1$Y),
+  Prevalence         = colSums(m1$Y > 0),
+  Explanatory_AUC    = MF$AUC,
+  Predictive_AUC     = MFCV$AUC,
+  Explanatory_TjurR2 = MF$TjurR2,
+  Predictive_TjurR2  = MFCV$TjurR2,
+  Explanatory_RMSE   = MF$RMSE,
+  Predictive_RMSE    = MFCV$RMSE
+) %>%
+  left_join(species_map, by = c("Species" = "original_name_in_data")) %>%
+  arrange(desc(Explanatory_TjurR2)) %>%
+  dplyr::select(pretty_name, Prevalence, Explanatory_AUC, Predictive_AUC,
+                Explanatory_TjurR2, Predictive_TjurR2)
+
+cat(sprintf("Mean predictive AUC     = %.3f (SD = %.3f)\n",
+            mean(MFCV$AUC), sd(MFCV$AUC)))
+cat(sprintf("Mean predictive Tjur R2 = %.3f (SD = %.3f)\n",
+            mean(MFCV$TjurR2), sd(MFCV$TjurR2)))
+
+knitr::kable(model_fit_df, digits = 3,
+             col.names = c("Species", "Prevalence", "Explanatory AUC",
+                           "Predictive AUC", "Explanatory Tjur R2", "Predictive Tjur R2"),
+             caption = "Table 2. Explanatory (in-sample) and predictive (4-fold cross-validation) model performance for each of the 13 tree species.")
+```
+
+```{r cv-plot, fig.cap = "Explanatory vs. predictive AUC per species. Points below the dashed 1:1 line indicate the degree of overfitting."}
+ggplot(model_fit_df, aes(x = Explanatory_AUC, y = Predictive_AUC)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(color = "darkblue", size = 3, alpha = 0.7) +
+  ggrepel::geom_text_repel(aes(label = pretty_name), size = 3) +
+  coord_equal(xlim = c(0.6, 1), ylim = c(0.6, 1)) +
+  labs(x = "Explanatory AUC (in-sample)",
+       y = "Predictive AUC (4-fold cross-validation)") +
+  theme_bw()
+```
+
+# 7. Variance Partitioning (Figure 1 of the manuscript)
+
+```{r variance-partitioning, fig.cap = "Variance partitioning of species occurrence into fixed-effect predictor groups and the random site effect."}
+VP <- computeVariancePartitioning(m1)
+
+vp_df <- VP$vals %>%
+  as_tibble(rownames = "variable") %>%
+  pivot_longer(cols = -variable, names_to = "Species", values_to = "value") %>%
+  left_join(species_map, by = c("Species" = "original_name_in_data"))
+
+variable_importance <- vp_df %>%
+  group_by(variable) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE)) %>%
+  arrange(desc(mean_value))
+
+knitr::kable(variable_importance, digits = 3,
+             caption = "Mean proportion of explained variance attributed to each predictor group / the random site effect, averaged across species.")
+
+ggplot(vp_df, aes(x = value, y = pretty_name, fill = variable)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Proportion of Explained Variance", y = "Species", fill = "Predictor group") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+```
+
+# 8. Species Environmental Niches (Beta Coefficients, Figure 4)
+
+```{r species-niches, fig.cap = "Posterior mean Beta coefficients with >=95% posterior support (species x environmental predictor)."}
+postBeta <- getPostEstimate(m1, parName = "Beta")
+predictor_names <- m1$covNames
+
+means_df <- postBeta$mean %>% as_tibble() %>%
+  mutate(variable = predictor_names, .before = 1) %>%
+  pivot_longer(cols = -variable, names_to = "Species", values_to = "Mean")
+
+supported_df <- postBeta$support %>% as_tibble() %>%
+  mutate(variable = predictor_names, .before = 1) %>%
+  pivot_longer(cols = -variable, names_to = "Species", values_to = "Support") %>%
+  left_join(means_df, by = c("variable", "Species")) %>%
+  dplyr::filter((Support > 0.95 | Support < 0.05), variable != "(Intercept)") %>%
+  mutate(sign = ifelse(Mean > 0, "+", "-")) %>%
+  left_join(species_map, by = c("Species" = "original_name_in_data")) %>%
+  dplyr::filter(!is.na(pretty_name))
+
+ggplot(supported_df, aes(x = variable, y = pretty_name, fill = Mean, color = sign)) +
+  geom_tile(linewidth = 0.5) +
+  scale_fill_gradient2(low = "darkblue", mid = "grey90", high = "darkred",
+                        midpoint = 0, name = "Mean Beta") +
+  scale_color_manual(values = c("+" = "red", "-" = "blue")) +
+  guides(color = "none") +
+  labs(x = "Environmental predictor", y = "Species") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+```
+
+# 9. Species Associations (Residual Correlation Matrix Omega, Figure A4-A5)
+
+```{r species-associations, fig.cap = "Significant residual species co-occurrences (posterior support > 95%), after accounting for shared environmental responses."}
+OmegaCor <- computeAssociations(m1)
+cor_matrix_mean <- OmegaCor[[1]]$mean
+support_matrix  <- OmegaCor[[1]]$support
+
+name_map <- species_map %>%
+  dplyr::filter(original_name_in_data %in% colnames(cor_matrix_mean)) %>%
+  dplyr::select(original_name_in_data, pretty_name) %>%
+  deframe()
+new_labels <- name_map[colnames(cor_matrix_mean)]
+colnames(cor_matrix_mean) <- rownames(cor_matrix_mean) <- new_labels
+colnames(support_matrix)  <- rownames(support_matrix)  <- new_labels
+
+supportLevel <- 0.95
+p_matrix <- ifelse(support_matrix > supportLevel | support_matrix < (1 - supportLevel), 0.01, 1)
+
+ggcorrplot::ggcorrplot(
+  cor_matrix_mean, hc.order = TRUE, type = "lower",
+  p.mat = p_matrix, insig = "blank", lab = FALSE,
+  colors = c("#5AB4AC", "#F5F5F5", "#D8B365"),
+  ggtheme = theme_minimal()
+) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.text.y = element_text(size = 8)) +
+  labs(fill = "Correlation")
+```
+
+# 10. Future Climate Scenarios and Predictions (Sections 3.1.3, 3.2.3)
+
+Species occurrence probabilities are predicted under four Shared
+Socioeconomic Pathways (SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5) and three
+30-year horizons (2011-2040, 2041-2070, 2071-2100), using downscaled
+ClimateNA projections for MAT and MAP at each plot. Predictions use
+`predictEtaMean = TRUE` (the posterior mean of the random-effect
+realisations rather than a per-draw resample), a computationally efficient
+simplification that slightly narrows -- but does not qualitatively change --
+the uncertainty propagated into the Community Suitability Index below.
+
+```{r future-climate-setup, eval = RUN_HEAVY}
+fut_clim_raw <- read_csv(file.path(BASE_DIR, "climate", "plots_coord_12_GCMsY.csv"),
+                          show_col_types = FALSE)
+gcm_scenarios <- unique(fut_clim_raw$GCM)
+
+XData_future_list <- list()
+for (scenario in gcm_scenarios) {
+  fut_clim_scenario <- fut_clim_raw %>%
+    dplyr::filter(GCM == scenario) %>%
+    dplyr::select(id1, MAT, MAP) %>%
+    rename(plot_id = id1) %>%
+    mutate(plot_id = as.character(plot_id))
+
+  XData_future_list[[scenario]] <- XData %>%
+    as_tibble(rownames = "plot_id") %>%
+    left_join(fut_clim_scenario, by = "plot_id") %>%
+    mutate(MAT = ifelse(is.na(MAT.y), MAT.x, MAT.y),
+           MAP = ifelse(is.na(MAP.y), MAP.x, MAP.y)) %>%
+    dplyr::select(-ends_with(".x"), -ends_with(".y")) %>%
+    column_to_rownames("plot_id")
+}
+XData_future_list[["Current"]] <- XData
+```
+
+```{r future-climate-predict, eval = RUN_HEAVY}
+# One posterior-prediction call per scenario; each returns a list of
+# [sites x species] matrices, one per retained posterior draw.
+for (scenario_name in names(XData_future_list)) {
+  message("Predicting scenario: ", scenario_name)
+
+  X_new <- XData_future_list[[scenario_name]]
+  fac_cols <- names(Filter(is.factor, m1$XData))
+  for (fc in fac_cols) {
+    if (fc %in% colnames(X_new)) X_new[[fc]] <- factor(X_new[[fc]], levels = levels(m1$XData[[fc]]))
+  }
+  X_new <- X_new[, colnames(m1$XData), drop = FALSE]
+
+  preds <- predict(m1, XData = X_new, expected = TRUE, predictEtaMean = TRUE)
+  save(preds, file = file.path(DRAWS_DIR, paste0(scenario_name, "_preds.Rda")))
+  rm(preds, X_new); gc()
+}
+```
+
+```{r future-climate-load, eval = !RUN_HEAVY}
+# --- Pre-computed posterior predictions per scenario -------------------------
+# 13 files: "Current" (baseline) + 4 SSPs x 3 horizons, each a list of
+# [sites x species] posterior-draw matrices, saved by the heavy chunk above.
+scenario_files <- list.files(DRAWS_DIR, pattern = "_preds\\.Rda$", full.names = TRUE)
+cat("Pre-computed prediction files found:", length(scenario_files), "\n")
+print(basename(scenario_files))
+```
+
+# 11. Community Suitability Index (Section 3.3)
+
+The Community Suitability Index (CSI) aggregates species-level occurrence
+probabilities into a single measure of habitat suitability for a
+pre-defined community. We compute the **geometric** CSI (gCSI), which
+penalises communities where any single constituent species has low
+suitability (a "weakest-link" property, consistent with Liebig's Law of the
+Minimum), together with the basic (bCSI) and weighted (wCSI) arithmetic-mean
+variants for completeness.
+
+$$
+gCSI_i = \left(\prod_{j=1}^{n} P_{ij}\right)^{1/n} = \exp\left(\frac{1}{n}\sum_{j=1}^{n}\ln(P_{ij})\right)
+$$
+
+Because HMSC yields a full posterior predictive distribution, we compute the
+CSI **per posterior draw** and only then summarise across draws -- this
+propagates parameter and prediction uncertainty consistently into the
+reported credible intervals, rather than applying the (non-linear) geometric
+mean to already-averaged summary statistics.
+
+```{r csi-community-definitions}
+# Ten representative forest community types (Table 1 of the manuscript),
+# each defined by a fixed assemblage of 4-5 dominant tree species.
+community_prefixes <- c("FE3", "FE6", "ME1", "MS6", "MS1", "MS2",
+                         "RE2", "RC3", "RP1", "RS2")
+
+type_eco_descriptions <- tibble::tribble(
+  ~type_eco_prefix, ~Description,
+  "FE3", "Sugar maple - Yellow birch Forest",
+  "FE6", "Sugar maple - Red oak Forest",
+  "ME1", "Black spruce - Trembling aspen Forest",
+  "MS6", "Balsam fir - Red maple Forest",
+  "MS1", "Balsam fir - Yellow birch Forest",
+  "MS2", "Balsam fir - Paper birch Forest",
+  "RE2", "Black spruce - Moss/heath Forest",
+  "RC3", "Peaty eastern white cedar - Balsam fir Forest",
+  "RP1", "White or red pine Forest",
+  "RS2", "Balsam fir - Black spruce Forest"
+)
+
+type_eco_species_codes <- tibble::tribble(
+  ~type_eco_prefix, ~dominant_codes, ~secondary_codes,
+  "FE3", c("ERS", "BOJ"), c("HEG", "PRU", "SAB", "BOP", "FRA"),
+  "FE6", c("ERS", "CHR"), c("BOJ", "BOP", "PIB", "ERR"),
+  "ME1", c("EPN", "PET"), c("BOP", "SAB"),
+  "MS6", c("SAB", "ERR"), c("BOP", "EPB"),
+  "MS1", c("SAB", "BOJ"), c("ERS", "EPB"),
+  "MS2", c("SAB", "BOP"), c("EPB", "EPN"),
+  "RE2", c("EPN"),        c("SAB", "PIG", "BOP"),
+  "RC3", c("THO", "SAB"), c("EPN", "MEL"),
+  "RP1", c("PIB", "PIR"), c("ERR", "CHR", "BOP"),
+  "RS2", c("SAB", "EPN"), c("BOP", "EPB")
+)
+
+community_defs <- purrr::pmap(
+  list(type_eco_species_codes$type_eco_prefix,
+       type_eco_species_codes$dominant_codes,
+       type_eco_species_codes$secondary_codes),
+  function(prefix, dom, sec) paste0(unique(c(dom, sec)), "_n")
+)
+names(community_defs) <- type_eco_species_codes$type_eco_prefix
+
+knitr::kable(type_eco_descriptions, caption = "Table 1. The ten representative forest communities used for CSI computation.")
+```
+
+```{r csi-functions}
+# --- Core CSI computation from posterior draws -------------------------------
+# All three indices (gCSI, bCSI, wCSI) are computed per posterior draw and
+# per site, then summarised (median, mean, SD, 95% credible interval) across
+# draws -- see Section 3.3.4 of the manuscript for the full rationale.
+epsilon <- 1e-4  # probability floor for numerical stability of log()
+
+summarise_posterior <- function(x, central = "median") {
+  x <- x[is.finite(x)]
+  if (!length(x)) return(tibble(center = NA, sd = NA, q025 = NA, q975 = NA))
+  tibble(
+    center = if (central == "median") median(x) else mean(x),
+    sd     = sd(x),
+    q025   = quantile(x, 0.025, na.rm = TRUE),
+    q975   = quantile(x, 0.975, na.rm = TRUE)
+  )
+}
+
+coerce_pred_obj_to_draws <- function(pred_obj) {
+  # 'preds' as returned by Hmsc::predict() is a list of [sites x species]
+  # matrices, one per posterior draw; reshape to a [draw x site x species] array.
+  n_draws <- length(pred_obj)
+  site_names    <- rownames(pred_obj[[1]])
+  species_names <- colnames(pred_obj[[1]])
+  draws <- array(NA_real_, dim = c(n_draws, nrow(pred_obj[[1]]), ncol(pred_obj[[1]])),
+                  dimnames = list(draw = paste0("draw_", seq_len(n_draws)),
+                                  site = site_names, species = species_names))
+  for (i in seq_len(n_draws)) draws[i, , ] <- pred_obj[[i]]
+  draws
+}
+
+compute_gCSI_matrix <- function(draws_sub, eps = epsilon) {
+  # Geometric mean in log-space, computed independently for every
+  # (posterior draw x site) cell, across the species that define the community.
+  logP <- log(pmax(draws_sub, eps))
+  log_g_matrix <- apply(logP, c(1, 2), mean)
+  list(g_matrix = exp(log_g_matrix), log_g_matrix = log_g_matrix)
+}
+
+summarise_community_gCSI <- function(log_g_matrix, central = "median") {
+  # Community-level index: geometric mean of the site-level gCSI, i.e. the
+  # mean of log(gCSI) across sites, taken independently for every draw, then
+  # summarised across draws.
+  comm_log <- apply(log_g_matrix, 1, function(row) mean(row[is.finite(row)]))
+  g_stats  <- summarise_posterior(exp(comm_log), central = central)
+  g_stats
+}
+```
+
+```{r csi-run, eval = RUN_HEAVY}
+scenario_map <- tibble::tribble(
+  ~scenario_label,       ~projection,   ~file_name,
+  "Current",             "Baseline",    "Current_preds.Rda",
+  "SSP1-2.6 2011-2040",  "2011-2040",   "8GCMs_ensemble_ssp126_2011-2040.gcm_preds.Rda",
+  "SSP1-2.6 2041-2070",  "2041-2070",   "8GCMs_ensemble_ssp126_2041-2070.gcm_preds.Rda",
+  "SSP1-2.6 2071-2100",  "2071-2100",   "8GCMs_ensemble_ssp126_2071-2100.gcm_preds.Rda",
+  "SSP2-4.5 2011-2040",  "2011-2040",   "8GCMs_ensemble_ssp245_2011-2040.gcm_preds.Rda",
+  "SSP2-4.5 2041-2070",  "2041-2070",   "8GCMs_ensemble_ssp245_2041-2070.gcm_preds.Rda",
+  "SSP2-4.5 2071-2100",  "2071-2100",   "8GCMs_ensemble_ssp245_2071-2100.gcm_preds.Rda",
+  "SSP3-7.0 2011-2040",  "2011-2040",   "8GCMs_ensemble_ssp370_2011-2040.gcm_preds.Rda",
+  "SSP3-7.0 2041-2070",  "2041-2070",   "8GCMs_ensemble_ssp370_2041-2070.gcm_preds.Rda",
+  "SSP3-7.0 2071-2100",  "2071-2100",   "8GCMs_ensemble_ssp370_2071-2100.gcm_preds.Rda",
+  "SSP5-8.5 2011-2040",  "2011-2040",   "8GCMs_ensemble_ssp585_2011-2040.gcm_preds.Rda",
+  "SSP5-8.5 2041-2070",  "2041-2070",   "8GCMs_ensemble_ssp585_2041-2070.gcm_preds.Rda",
+  "SSP5-8.5 2071-2100",  "2071-2100",   "8GCMs_ensemble_ssp585_2071-2100.gcm_preds.Rda"
+) %>% mutate(file_path = file.path(DRAWS_DIR, file_name))
+
+community_results <- list()
+for (i in seq_len(nrow(scenario_map))) {
+  scn <- scenario_map[i, ]
+  env <- new.env(parent = emptyenv())
+  load(scn$file_path, envir = env)
+  draws_array <- coerce_pred_obj_to_draws(env$preds)
+  available_species <- dimnames(draws_array)[[3]]
+
+  for (prefix in names(community_defs)) {
+    species_vec <- intersect(community_defs[[prefix]], available_species)
+    if (!length(species_vec)) next
+    species_idx <- match(species_vec, available_species)
+    g_list  <- compute_gCSI_matrix(draws_array[, , species_idx, drop = FALSE])
+    comm_g  <- summarise_community_gCSI(g_list$log_g_matrix)
+
+    community_results[[length(community_results) + 1]] <- comm_g %>%
+      mutate(scenario_label = scn$scenario_label,
+             projection_horizon = scn$projection,
+             community_prefix = prefix)
+  }
+}
+
+trajectory_results <- bind_rows(community_results) %>%
+  rename(gCenter = center, gSD = sd, gQ025 = q025, gQ975 = q975) %>%
+  left_join(type_eco_descriptions, by = "type_eco_prefix" = "community_prefix")
+
+write_csv(trajectory_results, file.path(OUTPUTS_DIR, "gCSI_trajectory_summary_draws.csv"))
+```
+
+```{r csi-load, eval = !RUN_HEAVY}
+# --- Load the pre-computed, per-draw CSI summary -----------------------------
+trajectory_results <- read_csv(file.path(OUTPUTS_DIR, "gCSI_trajectory_summary_draws.csv"),
+                                show_col_types = FALSE)
+```
+
+# 12. Community Suitability Trajectories Under Climate Change (Figure 3)
+
+```{r csi-trajectories-prep}
+trajectory_results <- trajectory_results %>%
+  mutate(
+    scenario_label = factor(scenario_label, levels = c(
+      "Current",
+      "SSP1-2.6 2011-2040", "SSP1-2.6 2041-2070", "SSP1-2.6 2071-2100",
+      "SSP2-4.5 2011-2040", "SSP2-4.5 2041-2070", "SSP2-4.5 2071-2100",
+      "SSP3-7.0 2011-2040", "SSP3-7.0 2041-2070", "SSP3-7.0 2071-2100",
+      "SSP5-8.5 2011-2040", "SSP5-8.5 2041-2070", "SSP5-8.5 2071-2100"
+    )),
+    community_label = factor(community_prefix, levels = community_prefixes)
+  ) %>%
+  left_join(type_eco_descriptions, by = c("community_prefix" = "type_eco_prefix"))
+```
+
+```{r csi-trajectories-table}
+trajectory_results %>%
+  dplyr::filter(scenario_label %in% c("Current", "SSP3-7.0 2071-2100")) %>%
+  dplyr::select(Description, scenario_label, gCenter, gQ025, gQ975) %>%
+  arrange(Description, scenario_label) %>%
+  knitr::kable(digits = 3,
+               col.names = c("Community", "Scenario", "Median gCSI", "2.5%", "97.5%"),
+               caption = "Geometric Community Suitability Index (gCSI): current baseline vs. SSP3-7.0, 2071-2100.")
+```
+
+```{r csi-trajectories-plot, fig.width = 9, fig.height = 8, fig.cap = "Projected community-level suitability (gCSI) under four SSP scenarios and three future horizons, relative to the current baseline (dashed line)."}
+ggplot(trajectory_results,
+       aes(x = scenario_label, y = gCenter,
+           colour = scenario_label, group = Description)) +
+  geom_hline(data = trajectory_results %>% dplyr::filter(scenario_label == "Current"),
+             aes(yintercept = gCenter), linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = gQ025, ymax = gQ975), width = 0, linewidth = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ Description, scales = "free_y", ncol = 2) +
+  labs(x = NULL, y = "Geometric CSI (gCSI)", colour = "Scenario") +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        legend.position = "bottom")
+```
+
+# 13. Appendix: Preparing Posterior-Draw Subsamples for the TCAMS App
+
+To keep the Tree Community-Assisted Migration Simulator (TCAMS, Section 3.5)
+responsive, the full posterior-draw prediction files (thousands of draws per
+scenario) are subsampled down to a manageable number of draws (`K`) before
+being bundled with the Shiny application. This is a one-off data-preparation
+utility, not part of the statistical analysis itself, and is therefore shown
+here for completeness but not executed.
+
+```{r tcams-subsample, eval = FALSE}
+original_draws_dir   <- file.path(RESULTS_DIR, "preds")
+subsampled_draws_dir <- file.path(BASE_DIR, "posterior_draws_200")
+K <- 400L
+
+load_preds <- function(path) {
+  env <- new.env(parent = emptyenv())
+  load(path, envir = env)
+  env$preds
+}
+
+subsample_preds <- function(preds, K) {
+  n_draws <- length(preds)
+  keep_n  <- min(K, n_draws)
+  idx <- if (keep_n < n_draws) sort(sample.int(n_draws, keep_n)) else seq_len(n_draws)
+  preds[idx]
+}
+
+dir.create(subsampled_draws_dir, recursive = TRUE, showWarnings = FALSE)
+rda_files <- list.files(original_draws_dir, pattern = "_preds\\.Rda$", full.names = TRUE)
+
+for (rda_path in rda_files) {
+  scenario_label <- sub("_preds\\.Rda$", "", basename(rda_path))
+  preds_full <- load_preds(rda_path)
+  preds <- subsample_preds(preds_full, K)
+  save(preds, file = file.path(subsampled_draws_dir,
+                                sprintf("%s_preds_subsampled.Rda", scenario_label)))
+  message(sprintf("%s: kept %d of %d draws", scenario_label, length(preds), length(preds_full)))
+}
+```
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
